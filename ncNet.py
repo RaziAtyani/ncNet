@@ -4,6 +4,7 @@ import pandas as pd
 import sqlite3
 import re
 import os
+import altair as alt
 
 import torch
 from model.VisAwareTranslation import translate_sentence_with_guidance, translate_sentence, postprocessing
@@ -187,8 +188,7 @@ class ncNet(object):
             print('[Predicted VIS Query]:', pred_query)
 
             # print('[The Predicted VIS Result]:')
-            return VegaLite(query2vl.to_VegaLite(pred_query, self.data)), query2vl.to_VegaLite(pred_query, self.data)
-            # print('\n')
+            return alt.Chart.from_dict(query2vl.to_VegaLite(pred_query, self.data)), query2vl.to_VegaLite(pred_query, self.data)            # print('\n')
 
         else:
             # print("\nGenerate the visualization by greedy decoding:\n")
@@ -210,8 +210,9 @@ class ncNet(object):
             print('[Predicted VIS Query]:', pred_query)
 
             # print('[The Predicted VIS Result]:')
-            return VegaLite(query2vl.to_VegaLite(pred_query, self.data)), query2vl.to_VegaLite(pred_query, self.data)
-
+            vl_spec = query2vl.to_VegaLite(pred_query, self.data)
+            chart = alt.Chart.from_dict(vl_spec)
+            return chart, vl_spec
 
     def process_input(self, nl_question, chart_template):
 
