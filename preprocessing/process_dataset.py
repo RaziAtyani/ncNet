@@ -5,7 +5,7 @@ import pandas as pd
 import sqlite3
 from dateutil.parser import parse
 import json
-import py_stringsimjoin as ssj
+import recordlinkage
 import re
 import os
 import time
@@ -114,62 +114,68 @@ class ProcessData4Training(object):
         '''
 
     def get_mentioned_values_in_NL_question(self, db_id, table_id, NL_question, db_table_col_val_map):
-        '''
-        high recall: to find a set of possible columns/vables mentioned in NL_question
-        '''
         columns_list = list(db_table_col_val_map[db_id][table_id].keys())
         values = db_table_col_val_map[db_id][table_id]
 
-        # we now only consider 1-gram, 2-gram, and 3-gram of the NL_question.
-        NL_tokens = NL_question.split(' ')  # 1-gram
-        two_grams, three_grams = [], []
-        # 2-gram
-        for i in range(len(NL_tokens) - 1):
-            two_grams.append(NL_tokens[i] + ' ' + NL_tokens[i + 1])
-        # 3-gram
-        for i in range(len(NL_tokens) - 2):
-            three_grams.append(NL_tokens[i] + ' ' + NL_tokens[i + 1] + ' ' + NL_tokens[i + 2])
-        NL_tokens += two_grams
-        NL_tokens += three_grams
+        # Create NL tokens DataFrame
+        NL_tokens = NL_question.split(' ')
+        two_grams = [' '.join(NL_tokens[i:i+2]) for i in range(len(NL_tokens)-1)]
+        three_grams = [' '.join(NL_tokens[i:i+3]) for i in range(len(NL_tokens)-2)]
+        NL_tokens += two_grams + three_grams
+        
+        A = pd.DataFrame({'name': NL_tokens, 'id': range(len(NL_tokens))})
+        
+        # Helper function for recordlinkage matching
+        def find_matches(left_df, right_df, threshold=2):
+            # Use blocking to avoid full index
+            indexer = recordlinkage.Index()
+            indexer.block(left_on='name', right_on='name')  # Key optimization
+            pairs = indexer.index(left_df, right_df)
+            
+            compare = recordlinkage.Compare()
+            compare.string('name', 'name', method='levenshtein', label='distance')
+            features = compare.compute(pairs, left_df, right_df)
+            
+            # Filter by distance threshold and calculate similarity score
+            matches = features[features['distance'] <= threshold].reset_index()
+            matches = matches.merge(left_df.reset_index(), left_on='level_0', right_index=True)
+            matches = matches.merge(right_df.reset_index(), left_on='level_1', right_index=True, 
+                                  suffixes=('_left', '_right'))
+            
+            if not matches.empty:
+                matches['max_len'] = matches[['name_left', 'name_right']].apply(
+                  lambda x: max(len(x['name_left']), len(x['name_right'])), axis=1
+                )
+                matches['sim_score'] = 1 - (matches['distance'] / matches['max_len'])
+                return matches.sort_values('sim_score', ascending=False)
+            return pd.DataFrame()
 
-        A = pd.DataFrame(data=NL_tokens, columns=['name'])
-        A['id'] = list(range(len(A)))
-        C = pd.DataFrame(data=columns_list, columns=['name'])
-        C['id'] = list(range(len(C)))
-        cand_col = ssj.edit_distance_join(
-            A, C, 'id', 'id', 'name', 'name', 2, l_out_attrs=['name'], r_out_attrs=['name'], show_progress=False
-        )
-        cand_col = cand_col.sort_values(by=['_sim_score'])
-        cand_col = list(cand_col['r_name'])
+        # Find matching columns
+        C = pd.DataFrame({'name': columns_list, 'id': range(len(columns_list))})
+        col_matches = find_matches(A, C)
         candidate_mentioned_col = []
-        for i in range(len(cand_col)):
-            if cand_col[i] not in candidate_mentioned_col:
-                candidate_mentioned_col.append(cand_col[i])
-            if len(candidate_mentioned_col) > 10:
-                break
+        if not col_matches.empty:
+            candidate_mentioned_col = col_matches.drop_duplicates('name_right')['name_right'].tolist()[:10]
 
-        B_value = []
-        for k, v in values.items():
-            for each_v in v:
-                B_value.append([k, each_v])
-        B = pd.DataFrame(data=B_value, columns=['col', 'name'])
-        B['id'] = list(range(len(B)))
-        output_pairs = ssj.edit_distance_join(
-            A, B, 'id', 'id', 'name', 'name', 2, l_out_attrs=['name'], r_out_attrs=['name', 'col'], show_progress=False
-        )
-        output_pairs = output_pairs.sort_values(by=['_sim_score'])
-        cand_val = list(zip(output_pairs['r_name'], output_pairs['r_col']))
+        # Find matching values
+        B_value = [[k, str(v)] for k, vals in values.items() for v in vals if v != '']
+        B = pd.DataFrame(B_value, columns=['col', 'name'])
+        B['id'] = range(len(B))
+        val_matches = find_matches(A, B)
+        
         candidate_mentioned_val = []
-        for i in range(len(cand_val)):
-            if cand_val[i][0] not in candidate_mentioned_val:
-                candidate_mentioned_val.append(cand_val[i][0])
-                if cand_val[i][1] not in candidate_mentioned_col:
-                    candidate_mentioned_col.append(cand_val[i][1])
-            if len(candidate_mentioned_val) > 10:
-                break
+        if not val_matches.empty:
+            # Get unique values and their associated columns
+            val_matches = val_matches.sort_values('sim_score', ascending=False)
+            for _, row in val_matches.iterrows():
+                if row['name_right'] not in candidate_mentioned_val:
+                    candidate_mentioned_val.append(row['name_right'])
+                    if row['col'] not in candidate_mentioned_col:
+                        candidate_mentioned_col.append(row['col'])
+                if len(candidate_mentioned_val) >= 10:
+                    break
 
-        return candidate_mentioned_col, candidate_mentioned_val
-
+        return candidate_mentioned_col[:10], candidate_mentioned_val[:10]
     def fill_in_query_template_by_chart_template(self, query):
         '''
         mark = {bar, pie, line, scatter}
